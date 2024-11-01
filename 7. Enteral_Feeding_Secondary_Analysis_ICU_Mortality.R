@@ -1,0 +1,120 @@
+library(tidyverse)
+library(survival)
+library(patchwork)
+library(survminer)
+library(randomForestSRC)
+options(scipen=999)
+
+# Set the working directory
+setwd("G:/Ivan")
+
+# Load the data
+data = readRDS("./Xinlei/Data/merged_data.rds")
+
+
+# Create ICU mortality
+## if the death date is earlier than the ICU admission date than replace it with NA
+data$death_date_sh_true = ifelse(difftime(data$death_date_sh, data$dt_icu_start_sh, units="days")<0, NA, data$death_date_sh)
+## caculate the number of seconds from ICU discharge to death. If it is less than 0, then the patient died in ICU
+data$icu_discharge_to_death_date = difftime(data$death_date_sh, data$dt_icu_end_sh, units="secs")
+
+## Patients who survived hospital admission cannot die in ICU
+## Patients who does not have a death date survive hospital admission
+data$dead_icu = ifelse(!(is.na(data$death_date_sh_true)) & data$icu_discharge_to_death_date>0, 0, 
+                     ifelse(!(is.na(data$death_date_sh_true)) & data$icu_discharge_to_death_date<0, 1, 0))
+
+
+## Normalize variables
+data$total_LA_volume_sqrt = sqrt(data$total_LA_volume)
+hist(data$total_LA_volume_sqrt)
+data$total_LA_volume_sqrt_z = scale(data$total_LA_volume_sqrt)[,1]
+hist(data$total_LA_volume_sqrt_z)
+
+data$total_Kcal_sqrt = sqrt(data$total_Kcal)
+data$total_Kcal_sqrt_z = scale(data$total_Kcal_sqrt)[,1]
+hist(data$total_Kcal_sqrt_z)
+
+data$apache3_sqrt = sqrt(data$apache3)
+hist(data$apache3_sqrt)
+data$apache3_sqrt_z = scale(data$apache3_sqrt)[,1]
+hist(data$apache3_sqrt_z)
+
+data$charlson_sqrt = sqrt(data$charlson)
+hist(data$charlson_sqrt)
+data$charlson_sqrt_z = scale(data$charlson_sqrt)[,1]
+hist(data$charlson_sqrt_z)
+
+
+logidata = data %>%  
+  mutate(dead_icu = ifelse(dead_icu == 1, "Yes", "No")) %>%
+  select(dead_icu, total_LA_volume_sqrt_z, 
+         age_at_admission, gender, race, charlson_sqrt_z, apache3_sqrt_z, 
+         total_Kcal_sqrt_z)
+
+completeData = logidata[complete.cases(logidata), ]
+
+
+# split the data into the training and testing set
+set.seed(960725)
+trainIndex <- createDataPartition(completeData$dead_icu, 
+                                  p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train = completeData[trainIndex,]
+test = completeData[-trainIndex,]
+
+trainLabel = train$dead_icu
+trainData = train[, -(which("dead_icu"==colnames(train)))]
+testLabel = test$dead_icu
+testData = test[, -(which("dead_icu"==colnames(test)))]
+
+# model to predict
+control = trainControl(method = "repeatedcv", number = 5, repeats = 1, 
+                       search = "grid", savePredictions = "final", 
+                       summaryFunction = twoClassSummary, classProbs = TRUE, 
+                       verboseIter = TRUE)
+
+# run a single rpart tree to find interactions
+#cart.model = train(x = trainData,
+#                   y = trainLabel,
+#                   method = "rpart", 
+#                   trControl = control,
+#                   metric = "ROC")
+#plot(cart.model$finalModel, uniform=TRUE,
+#     main="Classification Tree")
+#text(cart.model$finalModel, use.n.=TRUE, all=TRUE, cex=.8)
+#cart_mod_list[[i]] = cart.model
+
+
+# run a logistic regression
+logi.model = train(x = trainData,
+                   y = trainLabel,
+                   method = "glm", 
+                   family = "binomial",
+                   trControl = control,
+                   metric = "ROC")
+
+glm_fit = summary(logi.model)
+var_imp_list = varImp(logi.model)
+
+# evaluating on the testing set
+pred_prob = predict(logi.model, newdata = testData, type = "prob")
+test_sum_list = roc(testLabel, pred_prob$Yes) # 0.82
+
+glm_fit_df = data.frame(variable = rownames(glm_fit$coefficients),
+                        beta = glm_fit$coefficients[,c("Estimate")],
+                        se = glm_fit$coefficients[,c("Std. Error")],
+                        p = glm_fit$coefficients[,c("Pr(>|z|)")]) %>%
+  mutate(odds = exp(beta),
+         lower.ci = exp(beta - 1.96 * se),
+         upper.ci = exp(beta + 1.96 * se)) %>%
+  select(variable, beta, odds, se, lower.ci, upper.ci, p)
+
+names(glm_fit_df) = c("Variable", "Coefficient", "Odds Ratio", "Std. Err.", "Lower 95% CI", "Upper 95% CI", "P-value")
+
+glm_fit_df$Variable = c("(Intercept)", "Total LA Volume", "Age", "Gender: Male", "Race: Black", "Race: Other", "Charlson", "APACHE III", "Total Kcal")
+
+
+# Save the result
+write.csv(glm_fit_df, "./Xinlei/Result/Secondary_Analysis_ICU_Mortality_glm_fit_result.csv")
+
